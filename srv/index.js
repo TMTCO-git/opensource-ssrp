@@ -860,12 +860,22 @@ async function finishMfaCallback(c, tok, me) {
 
   if (!data.userId || me.id !== data.userId) return c.redirect("/?error=identity");
 
-  const claims = decodeJwtPayload(tok.id_token) || {};
-  const amr = Array.isArray(claims.amr) ? claims.amr : [];
-  console.error("SSPR MFA sign-in amr:", JSON.stringify(amr)); // shows in Observability logs, no secrets
-  if (!hasMfaClaim(amr)) {
-    // Temporary diagnostic: method names only (no secrets), shown on the error page.
-    return c.redirect(`/?error=mfa&amr=${encodeURIComponent(amr.join(",") || "none")}`);
+  // amr can be in the ID token or the access token, so read both.
+  const idClaims = decodeJwtPayload(tok.id_token);
+  const atClaims = decodeJwtPayload(tok.access_token);
+  const amr = [
+    ...(Array.isArray(idClaims?.amr) ? idClaims.amr : []),
+    ...(Array.isArray(atClaims?.amr) ? atClaims.amr : []),
+  ];
+  const uniqueAmr = [...new Set(amr)];
+  console.error("SSPR MFA sign-in amr:", JSON.stringify(uniqueAmr));
+
+  if (!hasMfaClaim(uniqueAmr)) {
+    // Temporary diagnostic: method names and token status only, shown on the error page.
+    const idStatus = !tok.id_token ? "no-id-token" : idClaims ? "id-ok" : "id-undecodable";
+    const atStatus = !tok.access_token ? "no-access-token" : atClaims ? "at-ok" : "at-opaque";
+    const detail = `${uniqueAmr.join(",") || "none"} [${idStatus}, ${atStatus}]`;
+    return c.redirect(`/?error=mfa&amr=${encodeURIComponent(detail)}`);
   }
 
   data.access_token = tok.access_token; // fresh token for the password change
