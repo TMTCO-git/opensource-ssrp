@@ -1,6 +1,6 @@
 {
   "name": "tmtco-ssrp",
-  "main": "src/index.js",
+  "main": "srv/index.js",
   "compatibility_date": "2024-11-01",
   "compatibility_flags": ["nodejs_compat"],
 
