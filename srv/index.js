@@ -248,7 +248,11 @@ const VERIFY_POLL_JS = String.raw`
     fetch('/verify/status', { credentials: 'same-origin', cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        if (d.error) { window.location.href = '/?error=expired'; return; }
+        if (d.error) {
+          status.textContent = 'This verification has ended. Refresh the page to start again.';
+          status.className = 'vc-status err';
+          return;
+        }
         if (d.status === 'presentation_verified') {
           status.textContent = 'Verified. Continuing...';
           status.className = 'vc-status ok';
@@ -631,7 +635,9 @@ app.get("/", async (c) => {
   }
 
   const { sid, data } = await getSession(c);
-  const error = ERROR_MESSAGES[c.req.query("error")] || "";
+  let error = ERROR_MESSAGES[c.req.query("error")] || "";
+  const returnedAmr = c.req.query("amr");
+  if (returnedAmr) error += ` (Microsoft returned: ${returnedAmr.slice(0, 200)})`;
 
   // Success screen after a completed reset (session already ended).
   if (!data && c.req.query("done") === "1") {
@@ -675,7 +681,7 @@ app.get("/", async (c) => {
 
     return page(c, {
       title: "Verify your identity",
-      script: VERIFY_POLL_JS,
+      script: verifyStepScript(vc),
       body: `<div class="card wide">
   <div class="badge">Step 2 of 3</div>
   <h2>Verify it's you</h2>
@@ -701,6 +707,11 @@ app.get("/", async (c) => {
   // Step 3: verified - enter current password and new password twice.
   return renderResetForm(c, data, error, 200);
 });
+
+// Only poll when a Verified ID request actually exists.
+function verifyStepScript(vc) {
+  return vc?.url ? VERIFY_POLL_JS : "";
+}
 
 function renderResetForm(c, data, error, status) {
   return page(c, {
@@ -833,6 +844,14 @@ app.get("/auth/mfa", async (c) => {
   return c.redirect(`https://login.microsoftonline.com/${c.env.TENANT_ID}/oauth2/v2.0/authorize?${params}`);
 });
 
+// Entra reports the methods used in the amr claim. Passkeys (FIDO2) and Windows Hello
+// don't always add a plain "mfa" value, so accept the known MFA values too.
+// "fido" or "hwk" together with "user" means a passkey/security key was used with user verification.
+function hasMfaClaim(amr) {
+  if (amr.some((v) => ["mfa", "ngcmfa", "wiamfa"].includes(v))) return true;
+  return amr.includes("user") && (amr.includes("fido") || amr.includes("hwk"));
+}
+
 // Completes the MFA option. Requires the same browser session and the same account,
 // and only accepts the sign-in if Microsoft reports that MFA was performed (amr contains "mfa").
 async function finishMfaCallback(c, tok, me) {
@@ -843,7 +862,11 @@ async function finishMfaCallback(c, tok, me) {
 
   const claims = decodeJwtPayload(tok.id_token) || {};
   const amr = Array.isArray(claims.amr) ? claims.amr : [];
-  if (!amr.includes("mfa")) return c.redirect("/?error=mfa");
+  console.error("SSPR MFA sign-in amr:", JSON.stringify(amr)); // shows in Observability logs, no secrets
+  if (!hasMfaClaim(amr)) {
+    // Temporary diagnostic: method names only (no secrets), shown on the error page.
+    return c.redirect(`/?error=mfa&amr=${encodeURIComponent(amr.join(",") || "none")}`);
+  }
 
   data.access_token = tok.access_token; // fresh token for the password change
   data.verified = true;
