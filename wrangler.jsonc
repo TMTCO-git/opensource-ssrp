@@ -29,7 +29,7 @@
     "TENANT_ID": "f1011f75-0d96-4d08-b8d4-6c79c851f9ba",
     "CLIENT_ID": "db8b6556-cec8-4b83-94b1-364cefd24203",
     "BASE_URL": "https://ssrp.tmtcoau.com",
-    'BASE_URL': 'https://ssrp-backup.tmtcoau.com',
+   
 
     // ---- Verified ID: issuance + sign-in (all optional) ----
     // Every value below already has a matching built-in default in
