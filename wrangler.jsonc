@@ -11,7 +11,7 @@
 
   "vars": {
     "TENANT_ID": "f1011f75-0d96-4d08-b8d4-6c79c851f9ba",
-    "CLIENT_ID": "db8b6556-cec8-4b83-94b1-364cefd24203",
+    "CLIENT_ID": "2d5ca26b-fd22-4591-a256-7702f6ab7a47",
 
     // Verified ID settings used by the SSRP
     "VC_AUTHORITY": "did:web:verifiedid.entra.microsoft.com:f1011f75-0d96-4d08-b8d4-6c79c851f9ba:f5674475-f43e-b35b-dcc6-5d3c3efe6441",
