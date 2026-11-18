@@ -3,6 +3,34 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 
 const app = new Hono();
 
+/*
+ * ============================================================
+ * REQUIRED SETUP (outside this file)
+ * ============================================================
+ * Entra app registration (SSRP app):
+ *   - Redirect URI: https://ssrp.tmtcoau.com/auth/callback
+ *   - Delegated permissions: User.Read, User.ReadWrite (admin consent granted)
+ *   - Verified ID: VerifiableCredential.Create.All (application), admin consent granted
+ *   - Client secret stored as the CLIENT_SECRET secret on the Worker
+ *
+ * Conditional Access (required for the MFA option):
+ *   - A policy must require MFA for this app, so every sign-in through the
+ *     "Use Microsoft multi-factor sign-in" option includes an MFA check.
+ *   - Without it, Microsoft can return a password-only sign-in and the Worker
+ *     rejects it (the amr claim will not contain "mfa").
+ *
+ * Users:
+ *   - Each user needs at least one MFA method registered (Microsoft
+ *     Authenticator, passkey, phone, etc.). Users with none can't use the MFA
+ *     option and need an admin to register a method or issue a Temporary Access Pass.
+ *
+ * Worker secrets and bindings:
+ *   - CLIENT_SECRET, VC_CALLBACK_KEY: secrets (set in the dashboard)
+ *   - SESSIONS: KV namespace binding
+ *   - TENANT_ID, CLIENT_ID, VC_AUTHORITY, VC_TYPE: variables
+ * ============================================================
+ */
+
 // ============================================================
 // CONFIG
 // ============================================================
@@ -36,7 +64,21 @@ const ERROR_MESSAGES = {
   expired: "Your session has expired. Please start again.",
   verify: "Verified ID did not confirm your identity. Please try again.",
   identity: "The Verified ID credential does not belong to the account you signed in with.",
+  mfa: "Microsoft did not complete a multi-factor check for this sign-in. If you have no MFA method set up, contact IT.",
 };
+
+// Reads the payload of a JWT. The token came straight from Microsoft's token endpoint over TLS,
+// so the payload is trusted here without re-checking the signature.
+function decodeJwtPayload(jwt) {
+  const part = String(jwt || "").split(".")[1];
+  if (!part) return null;
+  const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    return JSON.parse(atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, "=")));
+  } catch {
+    return null;
+  }
+}
 
 const MS_LOGO = `<svg viewBox="0 0 21 21" width="20" height="20" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
 <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
@@ -645,6 +687,9 @@ app.get("/", async (c) => {
     ${openLink}
     <p id="vcStatus" class="vc-status">Waiting for your Verified ID...</p>
   </div>
+  <div class="divider-line">or</div>
+  <p class="lead" style="margin-bottom:.8rem">Don't have Verified ID set up, or no phone with you? Confirm with Microsoft multi-factor sign-in instead.</p>
+  <a class="ms-login-btn" href="/auth/mfa">${MS_LOGO}<span>Use Microsoft multi-factor sign-in</span></a>
   <form method="post" action="/" class="vc-actions">
     <input type="hidden" name="action" value="logout"/>
     <button class="btn btn-ghost" type="submit" style="width:100%">Cancel</button>
@@ -751,7 +796,7 @@ app.get("/auth/login", async (c) => {
   if (missingConfig(c.env).length) return c.redirect("/?error=signin");
 
   const state = crypto.randomUUID();
-  await c.env.SESSIONS.put(`oauth:${state}`, "1", { expirationTtl: 300 });
+  await c.env.SESSIONS.put(`oauth:${state}`, JSON.stringify({ mode: "signin" }), { expirationTtl: 300 });
 
   const params = new URLSearchParams({
     client_id: c.env.CLIENT_ID,
@@ -765,6 +810,49 @@ app.get("/auth/login", async (c) => {
   return c.redirect(`https://login.microsoftonline.com/${c.env.TENANT_ID}/oauth2/v2.0/authorize?${params}`);
 });
 
+// Alternative second factor: a fresh Microsoft sign-in for the same account.
+// max_age=0 forces re-authentication, so the tenant's MFA policy applies.
+app.get("/auth/mfa", async (c) => {
+  const { data } = await getSession(c);
+  if (!data?.msAuthed || missingConfig(c.env).length) return c.redirect("/?error=expired");
+
+  const state = crypto.randomUUID();
+  await c.env.SESSIONS.put(`oauth:${state}`, JSON.stringify({ mode: "mfa" }), { expirationTtl: 300 });
+
+  const params = new URLSearchParams({
+    client_id: c.env.CLIENT_ID,
+    response_type: "code",
+    redirect_uri: `${BASE_URL}/auth/callback`,
+    response_mode: "query",
+    scope: GRAPH_SCOPES,
+    state,
+    prompt: "login",
+    max_age: "0",
+    login_hint: data.upn || data.email,
+  });
+  return c.redirect(`https://login.microsoftonline.com/${c.env.TENANT_ID}/oauth2/v2.0/authorize?${params}`);
+});
+
+// Completes the MFA option. Requires the same browser session and the same account,
+// and only accepts the sign-in if Microsoft reports that MFA was performed (amr contains "mfa").
+async function finishMfaCallback(c, tok, me) {
+  const { sid, data } = await getSession(c);
+  if (!data?.msAuthed || !sid) return c.redirect("/?error=expired");
+
+  if (!data.userId || me.id !== data.userId) return c.redirect("/?error=identity");
+
+  const claims = decodeJwtPayload(tok.id_token) || {};
+  const amr = Array.isArray(claims.amr) ? claims.amr : [];
+  if (!amr.includes("mfa")) return c.redirect("/?error=mfa");
+
+  data.access_token = tok.access_token; // fresh token for the password change
+  data.verified = true;
+  data.verifiedBy = "mfa";
+  data.verifiedAt = Date.now();
+  await saveSession(c, sid, data);
+  return c.redirect("/");
+}
+
 app.get("/auth/callback", async (c) => {
   const code = c.req.query("code");
   const state = c.req.query("state");
@@ -774,6 +862,7 @@ app.get("/auth/callback", async (c) => {
   const stored = await c.env.SESSIONS.get(stateKey);
   if (!stored) return c.redirect("/?error=signin");
   await c.env.SESSIONS.delete(stateKey); // single use
+  const mode = safeJson(stored)?.mode === "mfa" ? "mfa" : "signin";
 
   const tokenRes = await fetch(`https://login.microsoftonline.com/${c.env.TENANT_ID}/oauth2/v2.0/token`, {
     method: "POST",
@@ -796,10 +885,13 @@ app.get("/auth/callback", async (c) => {
   const me = await graphMe(tok.access_token).catch(() => null);
   if (!me || me.accountEnabled === false) return c.redirect("/?error=signin");
 
+  if (mode === "mfa") return finishMfaCallback(c, tok, me);
+
   await startSession(c, {
     msAuthed: true,
     verified: false,
     name: me.displayName || "",
+    userId: me.id || "",
     upn: me.userPrincipalName || "",
     email: me.mail || me.userPrincipalName || "",
     access_token: tok.access_token,
